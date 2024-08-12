@@ -1,0 +1,192 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import socket
+import threading
+from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
+import ipaddress
+
+class NetworkMapperGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Advanced Network Mapper")
+
+        # Custom color palette or theme
+        self.bg_color = '#f0f0f0'
+        self.fg_color = '#333333'
+
+        # Main container frame
+        main_frame = ttk.Frame(self.root, padding=20)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Title label
+        ttk.Label(main_frame, text="Advanced Network Mapper", font=('Arial', 18, 'bold')).pack(pady=(0, 20))
+
+        # Input frame
+        input_frame = ttk.Frame(main_frame)
+        input_frame.pack(pady=10, padx=10, fill=tk.BOTH)
+
+        # IP Address entry
+        ttk.Label(input_frame, text="Enter IP Address or Range:", font=('Arial', 12)).grid(row=0, column=0, sticky='w', padx=10, pady=5)
+        self.ip_entry = ttk.Entry(input_frame, width=40, font=('Arial', 12))
+        self.ip_entry.grid(row=0, column=1, padx=10, pady=5)
+
+        # Port range entry
+        ttk.Label(input_frame, text="Port Range (e.g., 1-1000):", font=('Arial', 12)).grid(row=1, column=0, sticky='w', padx=10, pady=5)
+        self.port_range_entry = ttk.Entry(input_frame, width=20, font=('Arial', 12))
+        self.port_range_entry.grid(row=1, column=1, padx=10, pady=5)
+
+        # Control buttons frame
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=10, padx=10, fill=tk.BOTH)
+
+        # Start scan button
+        self.start_button = ttk.Button(button_frame, text="Start Scan", command=self.start_scan)
+        self.start_button.grid(row=0, column=0, padx=10, pady=10)
+
+        # Stop scan button
+        self.stop_button = ttk.Button(button_frame, text="Stop Scan", command=self.stop_scan)
+        self.stop_button.grid(row=0, column=1, padx=10, pady=10)
+        self.stop_button.state(['disabled'])
+
+        # Save results button
+        self.save_button = ttk.Button(button_frame, text="Save Results", command=self.save_results)
+        self.save_button.grid(row=0, column=2, padx=10, pady=10)
+        self.save_button.state(['disabled'])
+
+        # Results frame
+        result_frame = ttk.Frame(main_frame)
+        result_frame.pack(padx=10, pady=20, fill=tk.BOTH, expand=True)
+
+        # Results text area with scrollbar
+        self.results_text = tk.Text(result_frame, height=15, width=80, font=('Arial', 12), wrap=tk.WORD)
+        self.results_text.grid(row=0, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(result_frame, orient=tk.VERTICAL, command=self.results_text.yview)
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        self.results_text.config(yscrollcommand=scrollbar.set)
+
+        # Progress bar
+        self.progress_bar = ttk.Progressbar(main_frame, mode='determinate')
+        self.progress_bar.pack(fill=tk.X, padx=20, pady=10)
+
+        # Queue to store scan results
+        self.result_queue = Queue()
+        self.stop_event = threading.Event()
+
+    def start_scan(self):
+        ip_range = self.ip_entry.get().strip()
+        port_range = self.port_range_entry.get().strip()
+
+        if not ip_range:
+            messagebox.showerror("Error", "Please enter an IP address or range.")
+            return
+        if not port_range:
+            messagebox.showerror("Error", "Please enter a port range.")
+            return
+
+        try:
+            ip_list = self.parse_ip_range(ip_range)
+            start_port, end_port = map(int, port_range.split('-'))
+
+            # Reset previous results and disable buttons
+            self.results_text.delete('1.0', tk.END)
+            self.result_queue.queue.clear()
+            self.stop_event.clear()
+            self.start_button.state(['disabled'])
+            self.stop_button.state(['!disabled'])
+            self.save_button.state(['disabled'])
+
+            total_ports = (end_port - start_port + 1) * len(ip_list)
+            self.progress_bar['maximum'] = total_ports
+
+            # Multithreaded port scan using ThreadPoolExecutor
+            self.thread_pool = ThreadPoolExecutor(max_workers=100)
+            self.threads = []
+            for ip in ip_list:
+                for port in range(start_port, end_port + 1):
+                    if self.stop_event.is_set():
+                        break
+                    future = self.thread_pool.submit(self.scan_port, ip, port)
+                    future.add_done_callback(lambda p: self.progress_bar.step())
+                    self.threads.append(future)
+
+            self.thread_pool.shutdown(wait=False)
+            self.root.after(100, self.check_scan_complete)
+
+        except Exception as e:
+            messagebox.showerror("Scan Error", f"An error occurred during scanning: {str(e)}")
+
+    def stop_scan(self):
+        self.stop_event.set()
+        self.thread_pool.shutdown(wait=False)
+        self.start_button.state(['!disabled'])
+        self.stop_button.state(['disabled'])
+        self.progress_bar['value'] = 0
+
+    def save_results(self):
+        file_path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        if file_path:
+            with open(file_path, 'w') as file:
+                file.write(self.results_text.get('1.0', tk.END))
+            messagebox.showinfo("Saved", "Results saved successfully.")
+
+    def check_scan_complete(self):
+        if all(future.done() for future in self.threads):
+            # Display results
+            if not self.result_queue.empty():
+                self.results_text.insert(tk.END, f"Open ports:\n")
+                while not self.result_queue.empty():
+                    ip, port, status, service = self.result_queue.get()
+                    color = 'green' if status else 'red'
+                    self.results_text.insert(tk.END, f"IP: {ip}, Port {port} is {'open' if status else 'closed'} - {service}\n", ('color',))
+                    self.results_text.tag_configure('color', foreground=color)
+            else:
+                self.results_text.insert(tk.END, f"No open ports found\n")
+            self.start_button.state(['!disabled'])
+            self.stop_button.state(['disabled'])
+            self.save_button.state(['!disabled'])
+            self.progress_bar['value'] = 0
+        else:
+            self.root.after(100, self.check_scan_complete)
+
+    def scan_port(self, ip_address, port):
+        if self.stop_event.is_set():
+            return
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)  # Adjust timeout as needed
+            result = sock.connect_ex((ip_address, port))
+            if result == 0:
+                service = self.get_service_name(port)
+                self.result_queue.put((ip_address, port, True, service))
+            else:
+                self.result_queue.put((ip_address, port, False, ''))
+            sock.close()
+        except Exception as e:
+            print(f"Error scanning port {port} on {ip_address}: {str(e)}")
+
+    def get_service_name(self, port):
+        try:
+            return socket.getservbyport(port)
+        except:
+            return "Unknown"
+
+    def parse_ip_range(self, ip_range):
+        try:
+            if '-' in ip_range:
+                start_ip, end_ip = ip_range.split('-')
+                start_ip = ipaddress.IPv4Address(start_ip)
+                end_ip = ipaddress.IPv4Address(end_ip)
+                return [str(ip) for ip in ipaddress.summarize_address_range(start_ip, end_ip)]
+            else:
+                return [str(ipaddress.IPv4Address(ip_range))]
+        except Exception as e:
+            messagebox.showerror("IP Range Error", f"Invalid IP range: {str(e)}")
+            return []
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = NetworkMapperGUI(root)
+    root.mainloop()
